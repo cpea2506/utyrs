@@ -1,6 +1,6 @@
+use crate::capabilities::codelens::UnityCodeLens;
 use crate::document_storage::DocumentStorage;
-use crate::{analyzer::Analyzer, capabilities::code_lens};
-use gen_lsp_types::{CodeLens, CodeLensParams, LspRequestMethod};
+use gen_lsp_types::{CodeLens, CodeLensParams, LspRequestMethod, Uri};
 use lsp_server::{Connection, ErrorCode, Message, Request, RequestId, Response, ResponseError};
 use std::error::Error;
 
@@ -12,7 +12,7 @@ pub struct UnityRequest<'a> {
     connection: &'a Connection,
     request: &'a Request,
     docs: &'a DocumentStorage,
-    analyzer: &'a Analyzer,
+    workspace_root: &'a Uri,
 }
 
 impl<'a> UnityRequest<'a> {
@@ -20,13 +20,13 @@ impl<'a> UnityRequest<'a> {
         connection: &'a Connection,
         request: &'a Request,
         docs: &'a DocumentStorage,
-        analyzer: &'a Analyzer,
+        workspace_root: &'a Uri,
     ) -> Self {
         Self {
             connection,
             request,
             docs,
-            analyzer,
+            workspace_root,
         }
     }
 }
@@ -40,20 +40,18 @@ impl<'a> RequestHandle for UnityRequest<'a> {
                 let params = serde_json::from_value::<CodeLensParams>(params)?;
                 let uri = params.text_document.uri;
 
-                let codelens = if let Some(content) = self.docs.get(&uri) {
-                    let analysis = self.analyzer.analyze_script(content, uri);
-                    code_lens::create_codelens(analysis)?
-                } else {
-                    Vec::new()
+                let codelens = match self.docs.get(&uri) {
+                    Some(content) => UnityCodeLens::create(self.workspace_root, content, uri)?,
+                    None => Vec::new(),
                 };
 
                 send_ok(self.connection, self.request.id.clone(), &codelens)?;
             }
             LspRequestMethod::CodeLensResolve => {
-                let mut codelens = serde_json::from_value::<CodeLens>(params)?;
-                codelens = code_lens::resolve_codelens(codelens)?;
+                let codelens = serde_json::from_value::<CodeLens>(params)?;
+                let resolved = UnityCodeLens::resolve(codelens)?;
 
-                send_ok(self.connection, self.request.id.clone(), &codelens)?;
+                send_ok(self.connection, self.request.id.clone(), &resolved)?;
             }
             _ => send_err(
                 self.connection,

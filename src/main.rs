@@ -1,11 +1,9 @@
-mod analyzer;
 mod capabilities;
 mod document_storage;
 mod notification;
 mod request;
 
 use crate::{
-    analyzer::Analyzer,
     notification::{NotificationHandle, UnityNotification},
     request::{RequestHandle, UnityRequest},
 };
@@ -69,7 +67,7 @@ fn main_loop(
     if let Some(WorkspaceFolderList(workspace_folders)) =
         params.workspace_folders_initialize_params.workspace_folders
     {
-        let analyzer = Analyzer::new(&workspace_folders[0].uri);
+        let workspace_root = &workspace_folders[0].uri;
 
         for msg in &connection.receiver {
             match msg {
@@ -78,7 +76,8 @@ fn main_loop(
                         break;
                     }
 
-                    let unity_request = UnityRequest::new(&connection, &request, &docs, &analyzer);
+                    let unity_request =
+                        UnityRequest::new(&connection, &request, &docs, workspace_root);
 
                     if let Err(err) = unity_request.handle() {
                         error!("[Unity LS] Request {} failed: {err}", &request.method);
