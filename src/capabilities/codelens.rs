@@ -1,13 +1,12 @@
 use gen_lsp_types::{CodeLens, Command, Location, Position, Range, Uri};
 use serde::{Deserialize, Serialize};
 use std::{
-    error::Error,
-    fmt::{self, Display},
     fs::File,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
-use tree_sitter::{Node, Parser};
+use thiserror::Error;
+use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 use walkdir::WalkDir;
 
 const SUPPORTED_EXTENSIONS: [&str; 3] = ["unity", "prefab", "asset"];
@@ -16,44 +15,42 @@ const SUPPORTED_EXTENSIONS: [&str; 3] = ["unity", "prefab", "asset"];
 pub type CodeLensResult<T> = Result<T, CodeLensError>;
 
 /// Error type for code lens operations.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum CodeLensError {
     /// Failed to serialize data to JSON.
-    SerializationFailed(String),
-    /// Failed to deserialize data from JSON.
-    DeserializationFailed(String),
+    #[error("serialization failed: {0}")]
+    Serialization(#[from] serde_json::Error),
     /// Invalid file URI.
+    #[error("invalid file URI: {0}")]
     InvalidUri(Uri),
     /// Invalid file path.
+    #[error("invalid file path: {0}")]
     InvalidPath(PathBuf),
     /// Missing required code lens data.
+    #[error("missing code lens data")]
     MissingData,
     /// Unable to read metadata file.
-    MetadataError(String),
+    #[error("unable to read metadata file {path}: {source}")]
+    MetadataRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Metadata file does not contain a guid line.
+    #[error("metadata file {path} does not contain a guid")]
+    MetadataMissingGuid { path: PathBuf },
+    /// Unable to read metadata file line.
+    #[error("unable to read metadata line {line} in {path}: {source}")]
+    MetadataLineRead {
+        path: PathBuf,
+        line: u32,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Failed to parse C# source with tree-sitter.
+    #[error("parse error: {0}")]
+    ParseError(String),
 }
-
-impl Display for CodeLensError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::SerializationFailed(msg) => write!(f, "serialization failed: {}", msg),
-            Self::DeserializationFailed(msg) => write!(f, "deserialization failed: {}", msg),
-            Self::InvalidUri(uri) => {
-                write!(f, "URI must be in the file scheme or similar: {}", uri)
-            }
-            Self::InvalidPath(path) => {
-                write!(
-                    f,
-                    "path must be absolute and must exist: {}",
-                    path.display()
-                )
-            }
-            Self::MissingData => write!(f, "missing code lens data"),
-            Self::MetadataError(msg) => write!(f, "metadata error: {}", msg),
-        }
-    }
-}
-
-impl Error for CodeLensError {}
 
 /// A reference to a script in a Unity asset file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,17 +91,17 @@ impl UnityCodeLens {
     /// # Errors
     ///
     /// Returns `CodeLensError` if serialization fails.
-    pub fn create(workspace_root: &Uri, content: &str, uri: Uri) -> CodeLensResult<Vec<CodeLens>> {
-        let assets_dir = workspace_root
-            .to_file_path()
-            .map_err(|_| CodeLensError::InvalidUri(uri.clone()))?
-            .join("Assets");
+    pub fn create(
+        workspace_root: &Path,
+        content: &str,
+        script_uri: &Uri,
+    ) -> CodeLensResult<Vec<CodeLens>> {
+        let assets_dir = workspace_root.join("Assets");
 
-        let class_line = parse_class_line(content).unwrap_or(0);
-        let asset_references = find_references(&assets_dir, uri)?;
+        let class_line = parse_class_line(content)?.unwrap_or(0);
+        let asset_references = find_references(&assets_dir, script_uri)?;
 
-        let data = serde_json::to_value(asset_references)
-            .map_err(|e| CodeLensError::SerializationFailed(e.to_string()))?;
+        let data = serde_json::to_value(asset_references)?;
 
         Ok(vec![CodeLens {
             range: Range {
@@ -123,20 +120,19 @@ impl UnityCodeLens {
     /// Returns `CodeLensError` if deserialization or location building fails.
     pub fn resolve(mut codelens: CodeLens) -> CodeLensResult<CodeLens> {
         let data = codelens.data.take().ok_or(CodeLensError::MissingData)?;
-        let asset_references = serde_json::from_value::<Vec<AssetReference>>(data)
-            .map_err(|e| CodeLensError::DeserializationFailed(e.to_string()))?;
+        let asset_references = serde_json::from_value::<Vec<AssetReference>>(data)?;
 
         let locations = asset_references
             .iter()
-            .filter_map(|r| r.to_codelens_location().ok())
-            .collect::<Vec<Location>>();
+            .map(AssetReference::to_codelens_location)
+            .collect::<CodeLensResult<Vec<Location>>>()?;
         let count = locations.len();
-        let title = match count {
-            0 | 1 => format!("{} Unity reference", count),
-            _ => format!("{} Unity references", count),
+        let title = if count == 1 {
+            "1 Unity reference".to_string()
+        } else {
+            format!("{count} Unity references")
         };
-        let arguments = serde_json::to_value(locations)
-            .map_err(|e| CodeLensError::SerializationFailed(e.to_string()))?;
+        let arguments = serde_json::to_value(locations)?;
 
         Ok(CodeLens {
             range: codelens.range,
@@ -151,7 +147,7 @@ impl UnityCodeLens {
     }
 }
 
-fn find_references(assets_dir: &Path, script_uri: Uri) -> CodeLensResult<Vec<AssetReference>> {
+fn find_references(assets_dir: &Path, script_uri: &Uri) -> CodeLensResult<Vec<AssetReference>> {
     let meta_path = script_uri
         .to_file_path()
         .map_err(|_| CodeLensError::InvalidUri(script_uri.clone()))?
@@ -159,7 +155,7 @@ fn find_references(assets_dir: &Path, script_uri: Uri) -> CodeLensResult<Vec<Ass
 
     let script_guid = extract_guid_from_meta(&meta_path)?;
 
-    Ok(find_asset_references(assets_dir, &script_guid))
+    find_asset_references(assets_dir, &script_guid)
 }
 
 fn extract_guid_from_meta(meta_path: &Path) -> CodeLensResult<String> {
@@ -169,24 +165,53 @@ fn extract_guid_from_meta(meta_path: &Path) -> CodeLensResult<String> {
      * guid: 83c14770bb100154e969c8bc1a4f153c
      * */
 
-    let file =
-        File::open(meta_path).map_err(|_| CodeLensError::InvalidPath(meta_path.to_path_buf()))?;
+    let file = File::open(meta_path).map_err(|source| CodeLensError::MetadataRead {
+        path: meta_path.to_path_buf(),
+        source,
+    })?;
 
-    BufReader::new(file)
-        .lines()
-        .find_map(|l| l.ok()?.strip_prefix("guid: ").map(str::to_owned))
-        .ok_or_else(|| CodeLensError::MetadataError("guid not found".into()))
+    for (line, line_result) in BufReader::new(file).lines().enumerate() {
+        let line = line_result.map_err(|source| CodeLensError::MetadataLineRead {
+            path: meta_path.to_path_buf(),
+            line: line as u32,
+            source,
+        })?;
+
+        if let Some(guid) = line.strip_prefix("guid: ") {
+            return Ok(guid.to_owned());
+        }
+    }
+
+    Err(CodeLensError::MetadataMissingGuid {
+        path: meta_path.to_path_buf(),
+    })
 }
 
-fn find_asset_references(assets_dir: &Path, script_guid: &str) -> Vec<AssetReference> {
-    WalkDir::new(assets_dir)
-        .into_iter()
-        .filter_map(|e| find_references_in_entry(e.ok()?.path(), script_guid))
-        .flatten()
-        .collect()
+fn find_asset_references(
+    assets_dir: &Path,
+    script_guid: &str,
+) -> CodeLensResult<Vec<AssetReference>> {
+    let mut references = Vec::new();
+
+    for entry in WalkDir::new(assets_dir).into_iter().filter_map(Result::ok) {
+        if let Some(mut found) = find_references_in_entry(entry.path(), script_guid) {
+            references.append(&mut found);
+        }
+    }
+
+    references.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.line_number.cmp(&right.line_number))
+    });
+
+    Ok(references)
 }
 
-fn find_references_in_entry(entry: &Path, script_guid: &str) -> Option<Vec<AssetReference>> {
+fn find_references_in_entry(
+    entry: &Path,
+    script_guid: &str,
+) -> Option<Vec<AssetReference>> {
     let ext = entry.extension().and_then(|e| e.to_str());
 
     if !ext.is_some_and(|e| SUPPORTED_EXTENSIONS.contains(&e)) {
@@ -194,16 +219,20 @@ fn find_references_in_entry(entry: &Path, script_guid: &str) -> Option<Vec<Asset
     }
 
     let file = File::open(entry).ok()?;
-    let references = BufReader::new(file)
-        .lines()
-        .enumerate()
-        .filter_map(|(lnum, l)| {
-            l.ok()?.contains(script_guid).then(|| AssetReference {
+    let mut references = Vec::new();
+
+    for (lnum, line) in BufReader::new(file).lines().enumerate() {
+        let Ok(line) = line else {
+            continue;
+        };
+
+        if line.contains(script_guid) {
+            references.push(AssetReference {
                 path: entry.to_path_buf(),
                 line_number: lnum as u32,
-            })
-        })
-        .collect::<Vec<AssetReference>>();
+            });
+        }
+    }
 
     if references.is_empty() {
         None
@@ -212,30 +241,24 @@ fn find_references_in_entry(entry: &Path, script_guid: &str) -> Option<Vec<Asset
     }
 }
 
-fn parse_class_line(content: &str) -> Option<u32> {
+fn parse_class_line(content: &str) -> CodeLensResult<Option<u32>> {
     let mut parser = Parser::new();
-    let language = tree_sitter_c_sharp::LANGUAGE;
+    let language = tree_sitter_c_sharp::LANGUAGE.into();
     parser
-        .set_language(&language.into())
-        .expect("Error loading CSharp parser");
+        .set_language(&language)
+        .map_err(|e| CodeLensError::ParseError(format!("failed to load C# parser: {e}")))?;
 
-    let tree = parser.parse(content, None)?;
+    let tree = parser
+        .parse(content, None)
+        .ok_or_else(|| CodeLensError::ParseError("failed to parse C# document".into()))?;
     let root = tree.root_node();
+    let query = Query::new(&language, "(class_declaration) @class")
+        .map_err(|e| CodeLensError::ParseError(format!("failed to compile C# query: {e}")))?;
+    let mut cursor = QueryCursor::new();
+    let mut captures = cursor.captures(&query, root, content.as_bytes());
 
-    find_class_node(root).map(|node| node.start_position().row as u32)
-}
-
-fn find_class_node(node: Node) -> Option<Node> {
-    if node.kind() == "class_declaration" {
-        return Some(node);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if let Some(found) = find_class_node(child) {
-            return Some(found);
-        }
-    }
-
-    None
+    Ok(captures
+        .next()
+        .map(|(query_match, capture_index)| query_match.captures[*capture_index].node)
+        .map(|node| node.start_position().row as u32))
 }

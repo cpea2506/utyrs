@@ -1,7 +1,11 @@
 [package]
 name = "utyrs"
 version = "0.1.0"
+description = "Unity-focused Language Server Protocol implementation"
 license = "MIT"
+repository = "https://github.com/cpea2506/unity_ls"
+keywords = ["unity", "lsp", "csharp", "language-server"]
+categories = ["development-tools", "game-development"]
 edition = "2024"
 
 [dependencies]
@@ -10,6 +14,7 @@ gen-lsp-types = { version = "0.5.0", features = ["url"] }
 lsp-server = "0.7.9"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 walkdir = "2.5.0"
